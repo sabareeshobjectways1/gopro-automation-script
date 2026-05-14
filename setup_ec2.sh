@@ -3,7 +3,7 @@
 
 echo "Updating system and installing dependencies..."
 sudo apt-get update
-sudo apt-get install -y python3 python3-pip python3-venv libgl1 libglib2.0-0 libgles2 curl
+sudo apt-get install -y python3 python3-pip python3-venv libgl1 libglib2.0-0 libgles2 libegl1 curl
 
 echo "Installing Node.js and PM2..."
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
