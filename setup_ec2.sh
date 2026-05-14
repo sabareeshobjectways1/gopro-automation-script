@@ -10,6 +10,10 @@ curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
 sudo npm install -g pm2
 
+echo "Creating Python virtual environment..."
+python3 -m venv venv
+./venv/bin/pip install --upgrade pip
+
 echo "Starting the automation script via PM2..."
 # Start the script using the ecosystem configuration
 pm2 start ecosystem.config.js
