@@ -574,7 +574,8 @@ def _extract_hand_landmarks(video_path: Path, start_ms: int, fps: float):
 # Returns the path to the produced .mcap.
 # --------------------------------------------------------------------------- #
 def _build_mcap(video: Path, session_meta: dict, imu_samples: list,
-                hand_lines: list, depth_record: dict, out_path: Path) -> Path:
+                hand_lines: list, depth_record: dict, out_path: Path,
+                video_name: str | None = None) -> Path:
     from mcap.writer import Writer
     _log(f"  [mcap] building {out_path.name} ...")
     t0 = time.time()
@@ -591,7 +592,7 @@ def _build_mcap(video: Path, session_meta: dict, imu_samples: list,
         with open(video, "rb") as vf:
             writer.add_attachment(
                 create_time=start_ns, log_time=start_ns,
-                name=video.name, media_type="video/mp4", data=vf.read(),
+                name=video_name or video.name, media_type="video/mp4", data=vf.read(),
             )
 
         if imu_samples:
@@ -690,8 +691,19 @@ def process_video_to_mcap(video: Path, sandbox: Path) -> Path:
         "source_video": video.name,
     }
 
+    # ----- Mute Video
+    muted_video = sandbox / f"{video.stem}_muted{video.suffix}"
+    _log(f"[ffmpeg] muting audio for {video.name}...")
+    subprocess.run([
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(video),
+        "-c:v", "copy",
+        "-an",
+        str(muted_video)
+    ], check=True)
+
     mcap_path = sandbox / f"{video.stem}.mcap"
-    _build_mcap(video, session_meta, imu_samples, hand_lines, depth_record, mcap_path)
+    _build_mcap(muted_video, session_meta, imu_samples, hand_lines, depth_record, mcap_path, video_name=video.name)
 
     return mcap_path
 
@@ -748,8 +760,18 @@ def _save_tracker(tracker: dict):
 
 
 def _is_processed(tracker: dict, key: str, etag: str) -> bool:
-    rec = tracker.get("processed", {}).get(key)
-    return bool(rec and rec.get("etag") == etag)
+    processed = tracker.get("processed", {})
+    
+    # 1. If this exact path was processed before, skip it
+    if key in processed:
+        return True
+        
+    # 2. If this exact file content (by S3 ETag) was processed under any folder, skip it
+    for p_data in processed.values():
+        if p_data.get("etag") == etag:
+            return True
+            
+    return False
 
 
 def _mark_processed(tracker: dict, key: str, etag: str):
@@ -800,6 +822,32 @@ class ProgressLogger:
         sys.stdout.write(f"\r  [{self.action}] {self.name}: {self.seen/(1024*1024):.1f}MB / {self.total/(1024*1024):.1f}MB ({pct}%)    ")
         sys.stdout.flush()
 
+def _prune_empty_s3_dirs(bucket: str, key: str, base_prefix: str):
+    """Removes empty directory markers in S3 up to the base_prefix."""
+    parts = key.split('/')[:-1]
+    for i in range(len(parts), 0, -1):
+        dir_key = "/".join(parts[:i]) + "/"
+        if dir_key == base_prefix or not dir_key.startswith(base_prefix):
+            break
+        try:
+            resp = s3.list_objects_v2(Bucket=bucket, Prefix=dir_key, MaxKeys=2)
+            contents = resp.get("Contents", [])
+            
+            is_empty = True
+            for obj in contents:
+                if obj["Key"] != dir_key:
+                    is_empty = False
+                    break
+                    
+            if is_empty:
+                s3.delete_object(Bucket=bucket, Key=dir_key)
+                _log(f"[cleanup] removed empty S3 folder: {dir_key}")
+            else:
+                break # Not empty, so parent won't be either
+        except Exception as e:
+            _log(f"[warn] failed to check/remove S3 folder {dir_key}: {e}")
+            break
+
 def _output_key_for(input_key: str, stem: str, file_name: str) -> str:
     """input/A/B/C.MP4 -> output/A/B/C/<file_name>"""
     rel = input_key[len(INPUT_PREFIX):]
@@ -847,6 +895,16 @@ def _process_one(video_obj: dict) -> tuple[str, str, bool, str | None]:
             Callback=up_prog
         )
         print() # new line after progress bar
+
+        _log(f"[cleanup] deleting source video s3://{BUCKET}/{key} to manage space")
+        try:
+            s3.delete_object(Bucket=BUCKET, Key=key)
+            _prune_empty_s3_dirs(BUCKET, key, INPUT_PREFIX)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "AccessDenied":
+                _log(f"[warn] Cannot delete s3://{BUCKET}/{key} due to AccessDenied. Update your bucket policy to allow s3:DeleteObject.")
+            else:
+                raise
 
         return key, etag, True, None
 
